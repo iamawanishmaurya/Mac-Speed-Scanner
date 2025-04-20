@@ -1,0 +1,363 @@
+#!/usr/bin/env python3
+import subprocess
+import time
+import os
+import sys
+import re
+from datetime import datetime
+
+# Check if running as root
+if os.geteuid() != 0:
+    print("This script must be run as root!")
+    print("Try: sudo " + sys.executable + " " + os.path.abspath(__file__))
+    sys.exit(1)
+
+# Configuration
+INTERFACE = "wlan0"  # Change to your WiFi interface
+MAC_ADDRESSES_FILE = "mac_address"
+RESULTS_FILE = "result.txt"
+USE_LOCAL_SCAN = True  # Set to True to use arp-scan instead of one.txt
+
+def detect_distro():
+    """Detect the Linux distribution"""
+    try:
+        with open('/etc/os-release', 'r') as f:
+            os_info = {}
+            for line in f:
+                if '=' in line:
+                    key, value = line.strip().split('=', 1)
+                    os_info[key] = value.strip('"')
+            
+            if 'ID' in os_info:
+                return os_info['ID']
+            else:
+                return "unknown"
+    except FileNotFoundError:
+        try:
+            # Try another method
+            process = subprocess.run(['lsb_release', '-i'], 
+                                    stdout=subprocess.PIPE, 
+                                    universal_newlines=True)
+            if process.returncode == 0:
+                return process.stdout.split(':')[1].strip().lower()
+        except:
+            pass
+    
+    return "unknown"
+
+def install_package(distro, package):
+    """Install a package based on the Linux distribution"""
+    print(f"Detected Linux distribution: {distro}")
+    try:
+        if distro in ["ubuntu", "debian", "linuxmint", "pop", "elementary"]:
+            print(f"Installing {package} using apt...")
+            subprocess.run(["apt-get", "update", "-y"], check=True)
+            subprocess.run(["apt-get", "install", "-y", package], check=True)
+        elif distro in ["fedora", "rhel", "centos"]:
+            print(f"Installing {package} using dnf...")
+            subprocess.run(["dnf", "install", "-y", package], check=True)
+        elif distro in ["arch", "manjaro"]:
+            print(f"Installing {package} using pacman...")
+            subprocess.run(["pacman", "-Sy", "--noconfirm", package], check=True)
+        elif distro in ["opensuse", "suse"]:
+            print(f"Installing {package} using zypper...")
+            subprocess.run(["zypper", "install", "-y", package], check=True)
+        else:
+            print(f"Unsupported distribution: {distro}")
+            print(f"Please install {package} manually and run the script again.")
+            return False
+        
+        print(f"{package} installed successfully.")
+        return True
+    except subprocess.CalledProcessError as e:
+        print(f"Failed to install {package}: {e}")
+        return False
+
+def check_command_exists(command):
+    """Check if a command exists in the system"""
+    try:
+        result = subprocess.run(["which", command], 
+                               capture_output=True, 
+                               text=True)
+        return result.returncode == 0
+    except:
+        return False
+
+def scan_network():
+    """Scan the local network for MAC addresses using arp-scan"""
+    print(f"Scanning local network on interface {INTERFACE}...")
+    
+    # Check if arp-scan is installed
+    if not check_command_exists("arp-scan"):
+        distro = detect_distro()
+        if not install_package(distro, "arp-scan"):
+            print("Failed to install arp-scan.")
+            return []
+    
+    try:
+        result = subprocess.run(
+            ["arp-scan", f"--interface={INTERFACE}", "--localnet"],
+            capture_output=True,
+            text=True,
+            check=True
+        )
+        
+        # Extract MAC addresses using regex
+        mac_pattern = r'([0-9A-Fa-f]{2}:[0-9A-Fa-f]{2}:[0-9A-Fa-f]{2}:[0-9A-Fa-f]{2}:[0-9A-Fa-f]{2}:[0-9A-Fa-f]{2})'
+        mac_addresses = re.findall(mac_pattern, result.stdout)
+        
+        # Filter out duplicates
+        mac_addresses = list(set(mac_addresses))
+        
+        if not mac_addresses:
+            print("No MAC addresses found in the scan.")
+            return []
+        
+        print(f"Found {len(mac_addresses)} unique MAC addresses on the local network.")
+        
+        # Save to file for reference
+        with open(MAC_ADDRESSES_FILE, 'w') as f:
+            for mac in mac_addresses:
+                f.write(f"{mac}\n")
+        print(f"MAC addresses saved to {MAC_ADDRESSES_FILE}")
+        
+        return mac_addresses
+    except subprocess.CalledProcessError as e:
+        print(f"Error scanning network: {e}")
+        print(f"Output: {e.stdout}")
+        print(f"Error: {e.stderr}")
+        return []
+
+def read_mac_addresses():
+    """Read MAC addresses from the specified file"""
+    try:
+        with open(MAC_ADDRESSES_FILE, 'r') as file:
+            # Read non-empty lines and strip whitespace
+            macs = [line.strip() for line in file if line.strip()]
+            total_macs = len(macs)
+            
+            if total_macs == 0:
+                print(f"Error: No MAC addresses found in {MAC_ADDRESSES_FILE}")
+                sys.exit(1)
+                
+            print(f"Loaded {total_macs} MAC addresses from {MAC_ADDRESSES_FILE}")
+            
+            # Validate MAC address format
+            invalid_macs = []
+            for mac in macs:
+                # Simple validation: 6 pairs of hex digits separated by colons
+                if not (len(mac) == 17 and mac.count(':') == 5):
+                    invalid_macs.append(mac)
+            
+            if invalid_macs:
+                print(f"Warning: Found {len(invalid_macs)} potentially invalid MAC addresses:")
+                for mac in invalid_macs[:5]:  # Show first 5 invalid MACs
+                    print(f" - {mac}")
+                if len(invalid_macs) > 5:
+                    print(f" - ... and {len(invalid_macs) - 5} more")
+                proceed = input("Continue anyway? (y/n): ").lower()
+                if proceed != 'y':
+                    sys.exit(0)
+            
+            return macs
+    except FileNotFoundError:
+        print(f"Error: {MAC_ADDRESSES_FILE} not found!")
+        sys.exit(1)
+    except Exception as e:
+        print(f"Error reading MAC addresses: {e}")
+        sys.exit(1)
+
+def set_mac_address(interface, mac):
+    """Change the MAC address of the specified interface"""
+    try:
+        # Disable interface
+        subprocess.run(["ip", "link", "set", "dev", interface, "down"], check=True)
+        # Set MAC address
+        subprocess.run(["ip", "link", "set", "dev", interface, "address", mac], check=True)
+        # Enable interface
+        subprocess.run(["ip", "link", "set", "dev", interface, "up"], check=True)
+        # Wait for network to reconnect
+        time.sleep(5)
+        print(f"MAC address changed to {mac}")
+        return True
+    except subprocess.CalledProcessError as e:
+        print(f"Failed to change MAC address: {e}")
+        return False
+
+def run_speedtest():
+    """Run speedtest and return download/upload speeds in Mbps"""
+    # Check if speedtest-cli is installed
+    if not check_command_exists("speedtest-cli"):
+        print("speedtest-cli not found. Installing speedtest-cli...")
+        distro = detect_distro()
+        if not install_package(distro, "speedtest-cli"):
+            print("Failed to install speedtest-cli. Cannot perform speed test.")
+            return {"download": None, "upload": None, "ping": None}
+    
+    try:
+        # Run speedtest using the user's environment
+        user = os.environ.get('SUDO_USER', 'root')
+        if user != 'root':
+            cmd = f"sudo -u {user} speedtest-cli --simple"
+        else:
+            cmd = "speedtest-cli --simple"
+            
+        print(f"Running command: {cmd}")
+        result = subprocess.run(cmd, shell=True, capture_output=True, text=True)
+        
+        # Check if the command executed successfully
+        if result.returncode != 0:
+            print(f"speedtest-cli failed with return code: {result.returncode}")
+            print(f"Error output: {result.stderr}")
+            return {"download": None, "upload": None, "ping": None}
+        
+        output = result.stdout
+        print(f"Raw speedtest output: {output}")
+        
+        # Parse the output
+        download = upload = ping = None
+        for line in output.strip().split('\n'):
+            if "Download" in line:
+                try:
+                    download = float(line.split(':')[1].split()[0])
+                except (IndexError, ValueError) as e:
+                    print(f"Error parsing download speed: {e}, Line: {line}")
+            elif "Upload" in line:
+                try:
+                    upload = float(line.split(':')[1].split()[0])
+                except (IndexError, ValueError) as e:
+                    print(f"Error parsing upload speed: {e}, Line: {line}")
+            elif "Ping" in line:
+                try:
+                    ping = float(line.split(':')[1].split()[0])
+                except (IndexError, ValueError) as e:
+                    print(f"Error parsing ping: {e}, Line: {line}")
+        
+        # Validate parsed results
+        if download is None and upload is None and ping is None:
+            print("Warning: Could not parse any values from speedtest output!")
+        
+        return {"download": download, "upload": upload, "ping": ping}
+    except Exception as e:
+        print(f"Speedtest error: {e}")
+        # Try debugging what happened
+        try:
+            # Try running with --version to see if speedtest-cli works at all
+            version_result = subprocess.run("speedtest-cli --version", 
+                                           shell=True, 
+                                           capture_output=True, 
+                                           text=True)
+            print(f"speedtest-cli version check: {version_result.stdout.strip()}")
+            print(f"Error: {version_result.stderr.strip()}")
+        except Exception as e2:
+            print(f"Failed to check speedtest-cli version: {e2}")
+        
+        return {"download": None, "upload": None, "ping": None}
+
+def write_results(results):
+    """Write test results to the output file, sorted by download speed"""
+    try:
+        # Sort results by download speed (highest first)
+        # Filter out None values first, then sort
+        valid_results = [r for r in results if r['download'] is not None]
+        invalid_results = [r for r in results if r['download'] is None]
+        
+        sorted_results = sorted(valid_results, key=lambda x: x['download'], reverse=True)
+        sorted_results.extend(invalid_results)  # Add failed tests at the end
+        
+        with open(RESULTS_FILE, 'w') as file:
+            total_tested = len(results)
+            successful_tests = len(valid_results)
+            
+            file.write("MAC Address Test Results - {}\n".format(datetime.now().strftime("%Y-%m-%d %H:%M:%S")))
+            file.write(f"Total MAC addresses tested: {total_tested}\n")
+            file.write(f"Successful tests: {successful_tests}\n")
+            file.write(f"Failed tests: {total_tested - successful_tests}\n")
+            file.write("-" * 75 + "\n")
+            file.write("{:<20} {:<15} {:<15} {:<10} {:<10}\n".format(
+                "MAC Address", "Download (Mbps)", "Upload (Mbps)", "Ping (ms)", "Rank"
+            ))
+            file.write("-" * 75 + "\n")
+            
+            for i, result in enumerate(sorted_results):
+                mac = result['mac']
+                download = result['download'] if result['download'] is not None else "Error"
+                upload = result['upload'] if result['upload'] is not None else "Error"
+                ping = result['ping'] if result['ping'] is not None else "Error"
+                rank = i + 1 if result['download'] is not None else "N/A"
+                
+                file.write("{:<20} {:<15} {:<15} {:<10} {:<10}\n".format(
+                    mac, download, upload, ping, rank
+                ))
+                
+        print(f"Results written to {RESULTS_FILE}")
+    except Exception as e:
+        print(f"Error writing results: {e}")
+
+def main():
+    print("=== MAC Address Speedtest Tool ===")
+    
+    # Check if we should use network scanning
+    if USE_LOCAL_SCAN:
+        # Scan for MAC addresses
+        mac_addresses = scan_network()
+        if not mac_addresses:
+            print("Falling back to MAC addresses from file.")
+            mac_addresses = read_mac_addresses()
+    else:
+        # Use MAC addresses from file
+        mac_addresses = read_mac_addresses()
+    
+    total_macs = len(mac_addresses)
+    print(f"Total MAC addresses to test: {total_macs}")
+    
+    # Initialize results list
+    results = []
+    
+    # Test each MAC address
+    for index, mac in enumerate(mac_addresses):
+        remaining = total_macs - index - 1
+        progress = ((index + 1) / total_macs) * 100
+        
+        print(f"\n[{index+1}/{total_macs}] Testing MAC address: {mac} ({progress:.1f}% complete)")
+        print(f"Remaining: {remaining} MAC addresses")
+        
+        if set_mac_address(INTERFACE, mac):
+            # Wait for connection to stabilize
+            print("Waiting for connection to stabilize...")
+            time.sleep(10)
+            
+            # Run speedtest
+            print("Running speedtest...")
+            speed_result = run_speedtest()
+            
+            # Store results
+            result = {
+                'mac': mac,
+                'download': speed_result['download'],
+                'upload': speed_result['upload'],
+                'ping': speed_result['ping']
+            }
+            results.append(result)
+            
+            print(f"Download: {speed_result['download']} Mbps")
+            print(f"Upload: {speed_result['upload']} Mbps")
+            print(f"Ping: {speed_result['ping']} ms")
+        else:
+            print(f"Skipping speedtest for MAC {mac} due to error")
+            results.append({
+                'mac': mac,
+                'download': None,
+                'upload': None,
+                'ping': None
+            })
+        
+        if remaining > 0:
+            print(f"MAC addresses remaining: {remaining}")
+    
+    # Write results to file, sorted by download speed
+    write_results(results)
+    print(f"\nAll {total_macs} tests completed! Results sorted by download speed.")
+
+if __name__ == "__main__":
+    main()
